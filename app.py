@@ -114,49 +114,52 @@ def coins_endpoint():
 
             # Process actions in the response
             if 'actions' in response_data and isinstance(response_data['actions'], list):
-                for action in response_data['actions']:
-                    if 'service' not in action:
-                        continue
-
-                    # Handle run_operation task
-                    if action['service'] == 'caldera' and action['task'] == 'run_operation':
-                        adversary = action.get('adversary')
-                        group = action.get('group', '')
-                        operation_name = action.get('operation_name')
-
-                        if not all([adversary, operation_name]):
-                            logger.warning(f"Invalid parameters in action: {action}")
+                try:
+                    for action in response_data['actions']:
+                        if 'service' not in action:
                             continue
 
-                        try:
-                            operation_response = retry_run_operation(operation_name, adversary, group)
-                            if operation_response:
-                                operation_id = operation_response.get('id')
-                                logger.info(f"Operation '{operation_name}' started with ID: {operation_id}")
-                                post_caldera_status(api_server_url, api_token, session_id, operation_name, operation_id, "started")
-                            else:
-                                logger.error(f"Failed to start operation '{operation_name}'.")
-                        except Exception as e:
-                            logger.error(f"Error running operation '{operation_name}': {e}")
+                        # Handle run_operation task
+                        if action['service'] == 'caldera' and action['task'] == 'run_operation':
+                            adversary = action.get('adversary')
+                            group = action.get('group', '')
+                            operation_name = action.get('operation_name')
 
-                    # Handle check_operation task
-                    elif action['service'] == 'caldera' and action['task'] == 'check_operation':
-                        operation_id = action.get('operation_id')
+                            if not all([adversary, operation_name]):
+                                logger.warning(f"Invalid parameters in action: {action}")
+                                continue
 
-                        if not operation_id:
-                            logger.warning(f"Invalid parameters in action: {action}")
-                            continue
+                            try:
+                                operation_response = retry_run_operation(operation_name, adversary, group)
+                                if operation_response:
+                                    operation_id = operation_response.get('id')
+                                    logger.info(f"Operation '{operation_name}' started with ID: {operation_id}")
+                                    post_caldera_status(api_server_url, api_token, session_id, operation_name, operation_id, "started")
+                                else:
+                                    logger.error(f"Failed to start operation '{operation_name}'.")
+                            except Exception as e:
+                                logger.error(f"Error running operation '{operation_name}': {e}")
 
-                        try:
-                            operation_status = check_operation_run(operation_id)
-                            if operation_status:
-                                status = operation_status.get('status')
-                                logger.info(f"Operation '{operation_id}' checked with current status: {status}")
-                                post_caldera_status(api_server_url, api_token, session_id, action.get('operation_name'), operation_id, status)
-                            else:
-                                logger.error(f"Failed to check operation '{operation_id}'.")
-                        except Exception as e:
-                            logger.error(f"Error checking operation '{operation_id}': {e}")
+                        # Handle check_operation task
+                        elif action['service'] == 'caldera' and action['task'] == 'check_operation':
+                            operation_id = action.get('operation_id')
+
+                            if not operation_id:
+                                logger.warning(f"Invalid parameters in action: {action}")
+                                continue
+
+                            try:
+                                operation_status = check_operation_run(operation_id)
+                                if operation_status:
+                                    status = operation_status.get('status')
+                                    logger.info(f"Operation '{operation_id}' checked with current status: {status}")
+                                    post_caldera_status(api_server_url, api_token, session_id, action.get('operation_name'), operation_id, status)
+                                else:
+                                    logger.error(f"Failed to check operation '{operation_id}'.")
+                            except Exception as e:
+                                logger.error(f"Error checking operation '{operation_id}': {e}")
+                except Exception as e:
+                    logger.error(f"Error running action: {e}")
 
             return jsonify({"message": "Session processed successfully."}), 200
         else:
