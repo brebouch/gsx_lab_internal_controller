@@ -1,8 +1,11 @@
 import os
 import logging
+import time
+
 import requests
 from flask import Flask, request, jsonify
 from dotenv import load_dotenv
+import xml.etree.ElementTree as ET
 from caldera.py_caldera import run_operation, check_operation_run
 
 # Load environment variables
@@ -16,7 +19,22 @@ logger = logging.getLogger()
 app = Flask(__name__)
 
 # Constants
-SESSION_XML_PATH = "session.xml"
+SESSION_XML_PATH = "/dcloud/session.xml"
+
+def read_session_xml_as_json(xml_path):
+    """
+    Reads the session.xml file and converts its data to JSON.
+    :param xml_path: Path to the XML file.
+    :return: JSON representation of the XML data.
+    """
+    try:
+        tree = ET.parse(xml_path)
+        root = tree.getroot()
+        session_data = {child.tag: child.text for child in root}
+        return session_data
+    except Exception as e:
+        logger.error(f"Error reading or parsing XML file: {e}")
+        return None
 
 
 def retry_run_operation(operation_name, adversary, group, retries=3, delay=5):
@@ -71,10 +89,17 @@ def coins_endpoint():
 
         # Parse the incoming request
         data = request.get_json()
-        if not data or "session" not in data:
-            return jsonify({"error": "Invalid payload. 'session' key is required."}), 400
+        if not data or "source" not in data:
+            return jsonify({"error": "Invalid payload. 'source' key is required."}), 400
 
-        session_id = data["session"]
+            # Read session.xml and convert to JSON
+        session_data = read_session_xml_as_json(SESSION_XML_PATH)
+        if not session_data:
+            logger.error("Failed to read session.xml or parse it into JSON.")
+            return jsonify({"error": "Unable to obtain dcloud session id"}), 400
+
+        session_id = session_data.get("id")
+        source = data["source"]
 
         # Make a POST request to the API_SERVER_URL with the session payload
         payload = {"session": session_id}
