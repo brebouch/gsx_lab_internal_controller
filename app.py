@@ -103,7 +103,7 @@ external_svc_lock = threading.Lock() # Lock for external service status variable
 app = Flask(__name__)
 
 # Constants
-SESSION_XML_PATH = "session.xml"
+SESSION_XML_PATH = "/dcloud/session.xml"
 DEVICE_HEALTH_TIMEOUT_SECONDS = 65
 
 
