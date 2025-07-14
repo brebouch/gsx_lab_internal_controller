@@ -198,7 +198,6 @@ def health_check():
                 last_updated = device_data.get("last_updated", 0) # Default to 0 if not present
 
                 if (current_time - last_updated) > DEVICE_HEALTH_TIMEOUT_SECONDS:
-                    logger.warning(f"Device {ip} health data is stale (last updated {current_time - last_updated:.2f}s ago). Resetting.")
                     # Reset to default values for this specific device
                     if ip in DEFAULT_FALLBACK_DEVICES_TEMPLATE:
                         reset_data = DEFAULT_FALLBACK_DEVICES_TEMPLATE[ip].copy()
@@ -216,7 +215,6 @@ def health_check():
                         coin_forge_health[ip]["network_bytes_out"] = "0"
                         coin_forge_health[ip]["remote_connection"] = False
                         coin_forge_health[ip]["last_updated"] = current_time
-                        logger.warning(f"Stale device {ip} not in default template; marking unreachable and resetting basic stats.")
 
 
         with external_svc_lock:
