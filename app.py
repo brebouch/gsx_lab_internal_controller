@@ -3,26 +3,44 @@ import os
 import time
 import xml.etree.ElementTree as ET
 import threading
+import sqlite3
 
 import requests
 from dotenv import load_dotenv
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 
-import redis
+# --- SQLite configuration for external health ---
+DB_PATH = "/tmp/health_status.db"
 
-# --- Redis configuration ---
-REDIS_HOST = os.getenv("REDIS_HOST", "localhost")
-REDIS_PORT = int(os.getenv("REDIS_PORT", "6379"))
-REDIS_DB = int(os.getenv("REDIS_DB", "0"))
+def init_db():
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("CREATE TABLE IF NOT EXISTS health (id INTEGER PRIMARY KEY, last_success REAL, response_time REAL)")
+    c.execute("INSERT OR IGNORE INTO health (id, last_success, response_time) VALUES (1, 0, 0)")
+    conn.commit()
+    conn.close()
 
-redis_client = redis.Redis(
-    host=REDIS_HOST, port=REDIS_PORT, db=REDIS_DB, decode_responses=True
-)
+def set_health(last_success, response_time):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("UPDATE health SET last_success=?, response_time=? WHERE id=1", (last_success, response_time))
+    conn.commit()
+    conn.close()
 
-REDIS_KEY_LAST_SUCCESS = "external_svc_last_success"
-REDIS_KEY_RESPONSE_TIME = "external_svc_response_time"
-REDIS_KEY_TIMEOUTS = "external_svc_timeouts"
+def get_health():
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("SELECT last_success, response_time FROM health WHERE id=1")
+    row = c.fetchone()
+    conn.close()
+    if row:
+        return float(row[0]), float(row[1])
+    else:
+        return 0.0, 0.0
+
+# Initialize DB at startup
+init_db()
 
 # Mocking caldera and dcloud_session for standalone execution if actual modules are not present
 class MockCaldera:
@@ -96,7 +114,7 @@ DEFAULT_FALLBACK_DEVICES_TEMPLATE = {
     }
 }
 
-# --- Global device health state (still in memory, single host) ---
+# --- Global device health state (in memory) ---
 coin_forge_health = {}
 for ip, data in DEFAULT_FALLBACK_DEVICES_TEMPLATE.items():
     coin_forge_health[ip] = data.copy()
@@ -202,18 +220,8 @@ def health_check():
                         coin_forge_health[ip]["remote_connection"] = False
                         coin_forge_health[ip]["last_updated"] = current_time
 
-        # --- External Service Health from Redis ---
         now = time.time()
-        try:
-            last_success = float(redis_client.get(REDIS_KEY_LAST_SUCCESS) or 0)
-            response_time = float(redis_client.get(REDIS_KEY_RESPONSE_TIME) or 0.0)
-            timeouts = int(redis_client.get(REDIS_KEY_TIMEOUTS) or 0)
-        except Exception as e:
-            logger.error(f"Error reading from Redis: {e}")
-            last_success = 0.0
-            response_time = 0.0
-            timeouts = 0
-
+        last_success, response_time = get_health()
         logger.info(f"/health-check: now={now}, last_success={last_success}, delta={now - last_success}")
 
         if (now - last_success) <= DEVICE_HEALTH_TIMEOUT_SECONDS:
@@ -222,11 +230,12 @@ def health_check():
         else:
             current_external_svc_reachable = False
             current_external_svc_response_time = 0.0
-        current_external_svc_timeouts = timeouts
+
+        # No tracking of timeouts in SQLite version; add if needed
 
         response_data = {
             "external_svc_reachable": current_external_svc_reachable,
-            "external_svc_timeouts": current_external_svc_timeouts,
+            "external_svc_timeouts": 0,
             "external_svc_response_time": current_external_svc_response_time,
         }
 
@@ -242,8 +251,6 @@ def coins_endpoint():
         api_token = os.getenv("API_TOKEN")
 
         if not all([api_server_url, api_token]):
-            redis_client.set(REDIS_KEY_TIMEOUTS, 0)
-            redis_client.set(REDIS_KEY_RESPONSE_TIME, 0.0)
             return jsonify({"error": "API_SERVER_URL and API_TOKEN environment variables must be set."}), 500
 
         data = request.get_json()
@@ -270,9 +277,9 @@ def coins_endpoint():
             response_time_ms = (end_time - start_time) * 1000
 
             if 200 <= response.status_code < 300:
-                redis_client.set(REDIS_KEY_LAST_SUCCESS, time.time())
-                redis_client.set(REDIS_KEY_RESPONSE_TIME, response_time_ms)
-                logger.info(f"/coins: Success! Setting external_svc_last_success = {redis_client.get(REDIS_KEY_LAST_SUCCESS)}")
+                now = time.time()
+                set_health(now, response_time_ms)
+                logger.info(f"/coins: Success! Setting last_success = {now}, response_time = {response_time_ms}")
             else:
                 logger.error(
                     f"POST request to API_SERVER_URL failed with status code {response.status_code}: {response.text}.")
@@ -282,21 +289,18 @@ def coins_endpoint():
             end_time = time.perf_counter()
             response_time_ms = (end_time - start_time) * 1000
             logger.error(f"POST request to API_SERVER_URL timed out after {response_time_ms:.2f} ms.")
-            redis_client.incr(REDIS_KEY_TIMEOUTS)
             return jsonify({"error": f"Failed to process session: Request to external service timed out."}), 504
 
         except requests.exceptions.ConnectionError as ce:
             end_time = time.perf_counter()
             response_time_ms = (end_time - start_time) * 1000
             logger.error(f"POST request to API_SERVER_URL failed to connect: {ce}.")
-            redis_client.incr(REDIS_KEY_TIMEOUTS)
             return jsonify({"error": f"Failed to process session: Connection to external service failed."}), 503
 
         except requests.exceptions.RequestException as e:
             end_time = time.perf_counter()
             response_time_ms = (end_time - start_time) * 1000
             logger.error(f"An unexpected error occurred during POST request to API_SERVER_URL: {e}.")
-            redis_client.incr(REDIS_KEY_TIMEOUTS)
             return jsonify({"error": f"Failed to process session: An unexpected error occurred with external service."}), 500
 
         # Process actions in the response (only if the request to API_SERVER_URL was successful)
