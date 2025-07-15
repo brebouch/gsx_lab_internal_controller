@@ -10,6 +10,8 @@ from dotenv import load_dotenv
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 
+import system_info
+
 # --- SQLite configuration for external health ---
 DB_PATH = "/tmp/health_status.db"
 
@@ -241,6 +243,8 @@ def health_check():
 
         with health_lock:
             response_data.update(coin_forge_health)
+
+        response_data.update({'controller_health': system_info.get_sys_info()})
 
         return jsonify(response_data), 200
 
