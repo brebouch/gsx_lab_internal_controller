@@ -7,6 +7,7 @@ import threading
 import requests
 from dotenv import load_dotenv
 from flask import Flask, request, jsonify
+from flask_cors import CORS
 
 # Mocking caldera and dcloud_session for standalone execution if actual modules are not present
 class MockCaldera:
@@ -101,6 +102,7 @@ external_svc_lock = threading.Lock() # Lock for external service status variable
 
 # Flask app
 app = Flask(__name__)
+CORS(app)
 
 # Constants
 SESSION_XML_PATH = "/dcloud/session.xml"
