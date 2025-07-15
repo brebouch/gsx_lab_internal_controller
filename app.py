@@ -9,6 +9,21 @@ from dotenv import load_dotenv
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 
+import redis
+
+# --- Redis configuration ---
+REDIS_HOST = os.getenv("REDIS_HOST", "localhost")
+REDIS_PORT = int(os.getenv("REDIS_PORT", "6379"))
+REDIS_DB = int(os.getenv("REDIS_DB", "0"))
+
+redis_client = redis.Redis(
+    host=REDIS_HOST, port=REDIS_PORT, db=REDIS_DB, decode_responses=True
+)
+
+REDIS_KEY_LAST_SUCCESS = "external_svc_last_success"
+REDIS_KEY_RESPONSE_TIME = "external_svc_response_time"
+REDIS_KEY_TIMEOUTS = "external_svc_timeouts"
+
 # Mocking caldera and dcloud_session for standalone execution if actual modules are not present
 class MockCaldera:
     def run_operation(self, operation_name, adversary, group):
@@ -30,21 +45,18 @@ class MockDcloudSession:
 caldera_mock = MockCaldera()
 dcloud_session_mock = MockDcloudSession()
 
-# Replace actual imports with mocks if needed for testing without full environment
 run_operation = caldera_mock.run_operation
 check_operation_run = caldera_mock.check_operation_run
 get_dcloud_session_xml = dcloud_session_mock.get_dcloud_session_xml
 
-
 # Load environment variables
 load_dotenv()
 
-# Configure logging
+# Logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger()
 
 # --- Define default fallback devices template ---
-# Initialize with a last_updated timestamp. This will be updated when a real health check comes in.
 DEFAULT_FALLBACK_DEVICES_TEMPLATE = {
     "198.18.5.154": {
         "reachable": False,
@@ -56,7 +68,7 @@ DEFAULT_FALLBACK_DEVICES_TEMPLATE = {
         "network_bytes_in": "0",
         "network_bytes_out": "0",
         "remote_connection": False,
-        "last_updated": 0.0 # Will be set to time.time() on app start or when reset
+        "last_updated": 0.0
     },
     "198.18.5.155": {
         "reachable": False,
@@ -68,7 +80,7 @@ DEFAULT_FALLBACK_DEVICES_TEMPLATE = {
         "network_bytes_in": "0",
         "network_bytes_out": "0",
         "remote_connection": False,
-        "last_updated": 0.0 # Will be set to time.time() on app start or when reset
+        "last_updated": 0.0
     },
     "198.18.5.156": {
         "reachable": False,
@@ -80,25 +92,17 @@ DEFAULT_FALLBACK_DEVICES_TEMPLATE = {
         "network_bytes_in": "0",
         "network_bytes_out": "0",
         "remote_connection": False,
-        "last_updated": 0.0 # Will be set to time.time() on app start or when reset
+        "last_updated": 0.0
     }
 }
 
-# --- Global health dictionaries and variables ---
-# Initialize coin_forge_health with a deep copy of the default fallback devices template
-# and set initial last_updated time.
+# --- Global device health state (still in memory, single host) ---
 coin_forge_health = {}
 for ip, data in DEFAULT_FALLBACK_DEVICES_TEMPLATE.items():
     coin_forge_health[ip] = data.copy()
-    coin_forge_health[ip]["last_updated"] = time.time() # Set initial last_updated
+    coin_forge_health[ip]["last_updated"] = time.time()
 
-health_lock = threading.Lock() # Lock for coin_forge_health dictionary
-
-# Global variables for external service status
-external_svc_reachable = False
-external_svc_timeouts = 0
-external_svc_response_time = 0.0 # in milliseconds
-external_svc_lock = threading.Lock() # Lock for external service status variables
+health_lock = threading.Lock()
 
 # Flask app
 app = Flask(__name__)
@@ -108,13 +112,7 @@ CORS(app)
 SESSION_XML_PATH = "/dcloud/session.xml"
 DEVICE_HEALTH_TIMEOUT_SECONDS = 65
 
-
 def read_session_xml_as_json(xml_path):
-    """
-    Reads the session.xml file and converts its data to JSON.
-    :param xml_path: Path to the XML file.
-    :return: JSON representation of the XML data.
-    """
     if not (os.path.isfile(xml_path)):
         get_dcloud_session_xml()
     try:
@@ -126,11 +124,7 @@ def read_session_xml_as_json(xml_path):
         logger.error(f"Error reading or parsing XML file: {e}")
         return None
 
-
 def retry_run_operation(operation_name, adversary, group, retries=3, delay=5):
-    """
-    Retry mechanism for running a Caldera operation.
-    """
     for attempt in range(retries):
         try:
             response = run_operation(operation_name, adversary, group)
@@ -141,11 +135,7 @@ def retry_run_operation(operation_name, adversary, group, retries=3, delay=5):
         time.sleep(delay)
     return None
 
-
 def post_caldera_status(api_server_url, api_token, session_id, operation_name, operation_id, status):
-    """
-    Posts the operation status to the /caldera endpoint.
-    """
     headers = {"Authorization": f'Bearer {api_token}'}
     payload = {
         "session_id": session_id,
@@ -164,7 +154,6 @@ def post_caldera_status(api_server_url, api_token, session_id, operation_name, o
     except Exception as e:
         logger.error(f"Error posting operation status for '{operation_name}': {e}")
 
-
 @app.route("/health-check", methods=["POST", "GET"])
 def health_check():
     if request.method == "POST":
@@ -177,10 +166,9 @@ def health_check():
             if not device_ip:
                 return jsonify({"error": "Payload missing 'ip' field."}), 400
 
-            # Create a copy of the incoming data and add 'reachable: True' and 'last_updated'
             device_health_data = data.copy()
             device_health_data["reachable"] = True
-            device_health_data["last_updated"] = time.time() # Update timestamp on successful post
+            device_health_data["last_updated"] = time.time()
 
             with health_lock:
                 coin_forge_health[device_ip] = device_health_data
@@ -194,21 +182,17 @@ def health_check():
         current_time = time.time()
 
         with health_lock:
-            # Iterate over a copy of keys to safely modify the dictionary during iteration
             for ip in list(coin_forge_health.keys()):
                 device_data = coin_forge_health[ip]
-                last_updated = device_data.get("last_updated", 0) # Default to 0 if not present
-
+                last_updated = device_data.get("last_updated", 0)
                 if (current_time - last_updated) > DEVICE_HEALTH_TIMEOUT_SECONDS:
                     # Reset to default values for this specific device
                     if ip in DEFAULT_FALLBACK_DEVICES_TEMPLATE:
                         reset_data = DEFAULT_FALLBACK_DEVICES_TEMPLATE[ip].copy()
-                        reset_data["reachable"] = False # Explicitly set to false if stale
-                        reset_data["last_updated"] = current_time # Update reset timestamp
+                        reset_data["reachable"] = False
+                        reset_data["last_updated"] = current_time
                         coin_forge_health[ip] = reset_data
                     else:
-                        # If an IP not in our default template somehow got in and went stale,
-                        # mark it unreachable and reset its timestamp and basic values.
                         coin_forge_health[ip]["reachable"] = False
                         coin_forge_health[ip]["cpu_utilization"] = "0.0"
                         coin_forge_health[ip]["memory_used_mb"] = "0"
@@ -218,11 +202,27 @@ def health_check():
                         coin_forge_health[ip]["remote_connection"] = False
                         coin_forge_health[ip]["last_updated"] = current_time
 
+        # --- External Service Health from Redis ---
+        now = time.time()
+        try:
+            last_success = float(redis_client.get(REDIS_KEY_LAST_SUCCESS) or 0)
+            response_time = float(redis_client.get(REDIS_KEY_RESPONSE_TIME) or 0.0)
+            timeouts = int(redis_client.get(REDIS_KEY_TIMEOUTS) or 0)
+        except Exception as e:
+            logger.error(f"Error reading from Redis: {e}")
+            last_success = 0.0
+            response_time = 0.0
+            timeouts = 0
 
-        with external_svc_lock:
-            current_external_svc_reachable = external_svc_reachable
-            current_external_svc_timeouts = external_svc_timeouts
-            current_external_svc_response_time = external_svc_response_time
+        logger.info(f"/health-check: now={now}, last_success={last_success}, delta={now - last_success}")
+
+        if (now - last_success) <= DEVICE_HEALTH_TIMEOUT_SECONDS:
+            current_external_svc_reachable = True
+            current_external_svc_response_time = response_time
+        else:
+            current_external_svc_reachable = False
+            current_external_svc_response_time = 0.0
+        current_external_svc_timeouts = timeouts
 
         response_data = {
             "external_svc_reachable": current_external_svc_reachable,
@@ -235,23 +235,15 @@ def health_check():
 
         return jsonify(response_data), 200
 
-
 @app.route("/coins", methods=["POST"])
 def coins_endpoint():
-    """
-    Endpoint for processing incoming requests from devices.
-    """
-    global external_svc_reachable, external_svc_timeouts, external_svc_response_time
-
     try:
         api_server_url = os.getenv("API_SERVER_URL")
         api_token = os.getenv("API_TOKEN")
 
         if not all([api_server_url, api_token]):
-            with external_svc_lock:
-                external_svc_reachable = False
-                external_svc_timeouts = 0
-                external_svc_response_time = 0.0
+            redis_client.set(REDIS_KEY_TIMEOUTS, 0)
+            redis_client.set(REDIS_KEY_RESPONSE_TIME, 0.0)
             return jsonify({"error": "API_SERVER_URL and API_TOKEN environment variables must be set."}), 500
 
         data = request.get_json()
@@ -277,48 +269,34 @@ def coins_endpoint():
             end_time = time.perf_counter()
             response_time_ms = (end_time - start_time) * 1000
 
-            with external_svc_lock:
-                if 200 <= response.status_code < 300:
-                    external_svc_reachable = True
-                    external_svc_response_time = response_time_ms # Keep actual response time on success
-                    logger.info("POST request to API_SERVER_URL successful!")
-                else:
-                    # Non-2xx response: reset external service status
-                    external_svc_reachable = False
-                    external_svc_timeouts = 0 # Reset timeouts
-                    external_svc_response_time = 0.0 # Reset response time as per user request
-                    logger.error(
-                        f"POST request to API_SERVER_URL failed with status code {response.status_code}: {response.text}. Resetting external service data.")
-                    return jsonify({"error": f"Failed to process session with status code {response.status_code}."}), response.status_code
+            if 200 <= response.status_code < 300:
+                redis_client.set(REDIS_KEY_LAST_SUCCESS, time.time())
+                redis_client.set(REDIS_KEY_RESPONSE_TIME, response_time_ms)
+                logger.info(f"/coins: Success! Setting external_svc_last_success = {redis_client.get(REDIS_KEY_LAST_SUCCESS)}")
+            else:
+                logger.error(
+                    f"POST request to API_SERVER_URL failed with status code {response.status_code}: {response.text}.")
+                return jsonify({"error": f"Failed to process session with status code {response.status_code}."}), response.status_code
 
         except requests.exceptions.Timeout:
             end_time = time.perf_counter()
             response_time_ms = (end_time - start_time) * 1000
-            with external_svc_lock:
-                external_svc_reachable = False
-                external_svc_timeouts = 0 # Reset timeouts
-                external_svc_response_time = 0.0 # Reset response time as per user request
-            logger.error(f"POST request to API_SERVER_URL timed out after {response_time_ms:.2f} ms. Resetting external service data.")
+            logger.error(f"POST request to API_SERVER_URL timed out after {response_time_ms:.2f} ms.")
+            redis_client.incr(REDIS_KEY_TIMEOUTS)
             return jsonify({"error": f"Failed to process session: Request to external service timed out."}), 504
 
         except requests.exceptions.ConnectionError as ce:
             end_time = time.perf_counter()
             response_time_ms = (end_time - start_time) * 1000
-            with external_svc_lock:
-                external_svc_reachable = False
-                external_svc_timeouts = 0 # Reset timeouts
-                external_svc_response_time = 0.0 # Reset response time as per user request
-            logger.error(f"POST request to API_SERVER_URL failed to connect: {ce}. Resetting external service data.")
+            logger.error(f"POST request to API_SERVER_URL failed to connect: {ce}.")
+            redis_client.incr(REDIS_KEY_TIMEOUTS)
             return jsonify({"error": f"Failed to process session: Connection to external service failed."}), 503
 
         except requests.exceptions.RequestException as e:
             end_time = time.perf_counter()
             response_time_ms = (end_time - start_time) * 1000
-            with external_svc_lock:
-                external_svc_reachable = False
-                external_svc_timeouts = 0 # Reset timeouts
-                external_svc_response_time = 0.0 # Reset response time as per user request
-            logger.error(f"An unexpected error occurred during POST request to API_SERVER_URL: {e}. Resetting external service data.")
+            logger.error(f"An unexpected error occurred during POST request to API_SERVER_URL: {e}.")
+            redis_client.incr(REDIS_KEY_TIMEOUTS)
             return jsonify({"error": f"Failed to process session: An unexpected error occurred with external service."}), 500
 
         # Process actions in the response (only if the request to API_SERVER_URL was successful)
@@ -375,7 +353,6 @@ def coins_endpoint():
     except Exception as e:
         logger.error(f"Error during processing: {e}")
         return jsonify({"error": str(e)}), 500
-
 
 if __name__ == "__main__":
     from waitress import serve
