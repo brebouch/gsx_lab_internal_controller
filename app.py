@@ -12,6 +12,9 @@ from flask_cors import CORS
 
 import system_info
 
+app = Flask(__name__)
+CORS(app)
+
 
 DEBOUNCE_FAIL_THRESHOLD = 4  # Number of missed checks before "down"
 DEBOUNCE_SUCCESS_THRESHOLD = 1  # Number of successful checks before "up"
@@ -153,8 +156,6 @@ for ip, data in DEFAULT_FALLBACK_DEVICES_TEMPLATE.items():
 health_lock = threading.Lock()
 
 # Flask app
-app = Flask(__name__)
-CORS(app)
 
 # Constants
 SESSION_XML_PATH = "/dcloud/session.xml"
