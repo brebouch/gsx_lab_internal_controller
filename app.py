@@ -133,9 +133,9 @@ DEFAULT_FALLBACK_DEVICES_TEMPLATE = {
         "remote_connection": False,
         "last_updated": 0.0
     },
-    "198.18.5.156": {
+    "10.1.100.20": {
         "reachable": False,
-        "ip": "198.18.5.156",
+        "ip": "10.1.100.20",
         "hostname": "CoinForge-3",
         "cpu_utilization": "0.0",
         "memory_used_mb": "0",
