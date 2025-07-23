@@ -111,7 +111,7 @@ logger = logging.getLogger()
 DEFAULT_FALLBACK_DEVICES_TEMPLATE = {
     "198.18.135.155": {
         "reachable": False,
-        "ip": "198.18.13.155",
+        "ip": "198.18.135.155",
         "hostname": "CoinForge-1",
         "cpu_utilization": "0.0",
         "memory_used_mb": "0",
