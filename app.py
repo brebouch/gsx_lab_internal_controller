@@ -13,7 +13,7 @@ from flask_cors import CORS
 import system_info
 
 app = Flask(__name__)
-CORS(app, origins=["*"])
+CORS(app, origins=["http://198.18.5.179"])
 
 
 DEBOUNCE_FAIL_THRESHOLD = 4  # Number of missed checks before "down"
