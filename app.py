@@ -12,6 +12,10 @@ from flask_cors import CORS
 
 import system_info
 
+
+DEBOUNCE_FAIL_THRESHOLD = 3  # Number of missed checks before "down"
+DEBOUNCE_SUCCESS_THRESHOLD = 2  # Number of successful checks before "up"
+
 # --- SQLite configuration for external health ---
 DB_PATH = "/tmp/health_status.db"
 
@@ -43,6 +47,30 @@ def get_health():
 
 # Initialize DB at startup
 init_db()
+
+
+def check_external_service_health(api_server_url, timeout=3):
+    """Ping the external API root and return (reachable, response_time_ms)."""
+    logger.info(f"Checking health of external API at {api_server_url} with timeout {timeout}s")
+    try:
+        start = time.perf_counter()
+        resp = requests.get(api_server_url, timeout=timeout)
+        elapsed_ms = (time.perf_counter() - start) * 1000
+        logger.info(f"Got response from {api_server_url} in {elapsed_ms:.2f} ms with status {resp.status_code}")
+        if 200 <= resp.status_code < 300:
+            return True, elapsed_ms
+        else:
+            logger.warning(f"Received unexpected status code {resp.status_code} from external API")
+            return False, elapsed_ms
+    except requests.exceptions.Timeout:
+        logger.error(f"Timeout when connecting to external API at {api_server_url}")
+        return False, 0.0
+    except requests.exceptions.ConnectionError as ce:
+        logger.error(f"Connection error when connecting to external API at {api_server_url}: {ce}")
+        return False, 0.0
+    except Exception as e:
+        logger.error(f"Unexpected error when checking external API health: {e}")
+        return False, 0.0
 
 # Mocking caldera and dcloud_session for standalone execution if actual modules are not present
 class MockCaldera:
@@ -78,9 +106,9 @@ logger = logging.getLogger()
 
 # --- Define default fallback devices template ---
 DEFAULT_FALLBACK_DEVICES_TEMPLATE = {
-    "198.18.5.154": {
+    "198.18.135.155": {
         "reachable": False,
-        "ip": "198.18.5.154",
+        "ip": "198.18.13.155",
         "hostname": "CoinForge-1",
         "cpu_utilization": "0.0",
         "memory_used_mb": "0",
@@ -130,7 +158,7 @@ CORS(app)
 
 # Constants
 SESSION_XML_PATH = "/dcloud/session.xml"
-DEVICE_HEALTH_TIMEOUT_SECONDS = 65
+DEVICE_HEALTH_TIMEOUT_SECONDS = 90
 
 def read_session_xml_as_json(xml_path):
     if not (os.path.isfile(xml_path)):
@@ -186,13 +214,31 @@ def health_check():
             if not device_ip:
                 return jsonify({"error": "Payload missing 'ip' field."}), 400
 
-            device_health_data = data.copy()
-            device_health_data["reachable"] = True
-            device_health_data["last_updated"] = time.time()
-
+            now = time.time()
+            # Get or initialize device state
             with health_lock:
-                coin_forge_health[device_ip] = device_health_data
-            logger.info(f"Updated coin_forge_health for device IP {device_ip}.")
+                device_state = coin_forge_health.get(device_ip, DEFAULT_FALLBACK_DEVICES_TEMPLATE.get(device_ip, {})).copy()
+                device_state.setdefault("consecutive_failures", 0)
+                device_state.setdefault("consecutive_successes", 0)
+                device_state.setdefault("state", "down")
+                # Update health data fields from incoming data
+                for key, value in data.items():
+                    device_state[key] = value
+
+                device_state["last_updated"] = now
+                device_state["consecutive_failures"] = 0
+                device_state["consecutive_successes"] += 1
+
+                # Debounce: Only mark up after threshold
+                if device_state["state"] != "up" and device_state["consecutive_successes"] >= DEBOUNCE_SUCCESS_THRESHOLD:
+                    device_state["state"] = "up"
+                    # Optional: Reset counter on state change
+                    device_state["consecutive_successes"] = 0
+
+                device_state["reachable"] = (device_state["state"] == "up")
+                coin_forge_health[device_ip] = device_state
+
+            logger.info(f"Updated debounced coin_forge_health for device IP {device_ip}.")
             return jsonify({"message": "Health-check received.", "device_ip": device_ip}), 200
         except Exception as e:
             logger.error(f"Error in health_check POST endpoint: {e}")
@@ -200,49 +246,45 @@ def health_check():
 
     elif request.method == "GET":
         current_time = time.time()
-
         with health_lock:
-            for ip in list(coin_forge_health.keys()):
-                device_data = coin_forge_health[ip]
+            for ip, device_data in coin_forge_health.items():
                 last_updated = device_data.get("last_updated", 0)
+                device_data.setdefault("consecutive_failures", 0)
+                device_data.setdefault("consecutive_successes", 0)
+                device_data.setdefault("state", "up")
                 if (current_time - last_updated) > DEVICE_HEALTH_TIMEOUT_SECONDS:
-                    # Reset to default values for this specific device
-                    if ip in DEFAULT_FALLBACK_DEVICES_TEMPLATE:
-                        reset_data = DEFAULT_FALLBACK_DEVICES_TEMPLATE[ip].copy()
-                        reset_data["reachable"] = False
-                        reset_data["last_updated"] = current_time
-                        coin_forge_health[ip] = reset_data
-                    else:
-                        coin_forge_health[ip]["reachable"] = False
-                        coin_forge_health[ip]["cpu_utilization"] = "0.0"
-                        coin_forge_health[ip]["memory_used_mb"] = "0"
-                        coin_forge_health[ip]["memory_total_mb"] = "0"
-                        coin_forge_health[ip]["network_bytes_in"] = "0"
-                        coin_forge_health[ip]["network_bytes_out"] = "0"
-                        coin_forge_health[ip]["remote_connection"] = False
-                        coin_forge_health[ip]["last_updated"] = current_time
+                    device_data["consecutive_failures"] += 1
+                    device_data["consecutive_successes"] = 0
+                    # Debounce: Only mark down after threshold
+                    if device_data["state"] != "down" and device_data["consecutive_failures"] >= DEBOUNCE_FAIL_THRESHOLD:
+                        device_data["state"] = "down"
+                        # Optional: Reset counter on state change
+                        device_data["consecutive_failures"] = 0
+                    device_data["reachable"] = (device_data["state"] == "up")
+                # else: success handled in POST
+                coin_forge_health[ip] = device_data
 
-        now = time.time()
-        last_success, response_time = get_health()
-        logger.info(f"/health-check: now={now}, last_success={last_success}, delta={now - last_success}")
-
-        if (now - last_success) <= DEVICE_HEALTH_TIMEOUT_SECONDS:
-            current_external_svc_reachable = True
-            current_external_svc_response_time = response_time
+        # Check external API health
+        api_server_url = os.getenv("API_SERVER_URL")
+        if not api_server_url:
+            logger.warning("API_SERVER_URL environment variable is not set.")
+            external_svc_reachable = False
+            external_svc_response_time = 0.0
         else:
-            current_external_svc_reachable = False
-            current_external_svc_response_time = 0.0
-
-        # No tracking of timeouts in SQLite version; add if needed
+            external_svc_reachable, external_svc_response_time = check_external_service_health(api_server_url, timeout=1)
 
         response_data = {
-            "external_svc_reachable": current_external_svc_reachable,
-            "external_svc_timeouts": 0,
-            "external_svc_response_time": current_external_svc_response_time,
+            "external_svc_reachable": external_svc_reachable,
+            "external_svc_timeouts": 0,  # Optionally track real timeouts
+            "external_svc_response_time": external_svc_response_time,
         }
 
         with health_lock:
-            response_data.update(coin_forge_health)
+            # Exclude debounce counters from output if you wish
+            response_data.update({
+                ip: {k: v for k, v in data.items() if k not in ("consecutive_failures", "consecutive_successes", "state")}
+                for ip, data in coin_forge_health.items()
+            })
 
         response_data.update({'controller_health': system_info.get_sys_info()})
 
