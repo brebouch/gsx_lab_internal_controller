@@ -13,7 +13,7 @@ from flask_cors import CORS
 import system_info
 
 
-DEBOUNCE_FAIL_THRESHOLD = 3  # Number of missed checks before "down"
+DEBOUNCE_FAIL_THRESHOLD = 4  # Number of missed checks before "down"
 DEBOUNCE_SUCCESS_THRESHOLD = 1  # Number of successful checks before "up"
 
 # --- SQLite configuration for external health ---
