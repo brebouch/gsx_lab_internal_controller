@@ -159,7 +159,7 @@ health_lock = threading.Lock()
 
 # Constants
 SESSION_XML_PATH = "/dcloud/session.xml"
-DEVICE_HEALTH_TIMEOUT_SECONDS = 90
+DEVICE_HEALTH_TIMEOUT_SECONDS = 900
 
 def read_session_xml_as_json(xml_path):
     if not (os.path.isfile(xml_path)):
