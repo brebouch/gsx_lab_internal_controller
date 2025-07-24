@@ -2,7 +2,6 @@ import logging
 import os
 import time
 import xml.etree.ElementTree as ET
-import threading
 import sqlite3
 
 import requests
@@ -15,20 +14,28 @@ import system_info
 app = Flask(__name__)
 CORS(app, origins=["http://198.18.5.179"])
 
-
 DEBOUNCE_FAIL_THRESHOLD = 1  # Number of missed checks before "down"
 DEBOUNCE_SUCCESS_THRESHOLD = 1  # Number of successful checks before "up"
 
 COINFORGE_REQUIRED_IPS = {"10.104.255.110", "198.18.5.155", "10.1.100.20"}
 
-# --- SQLite configuration for external health ---
 DB_PATH = "/tmp/health_status.db"
+INCIDENT_TIMER_SECONDS = 300  # 5 minutes
 
 def init_db():
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     c.execute("CREATE TABLE IF NOT EXISTS health (id INTEGER PRIMARY KEY, last_success REAL, response_time REAL)")
     c.execute("INSERT OR IGNORE INTO health (id, last_success, response_time) VALUES (1, 0, 0)")
+    # Incident logic state: one-row table
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS incident_state (
+            id INTEGER PRIMARY KEY CHECK (id = 1),
+            timer_started_at REAL DEFAULT 0,
+            incident_ready INTEGER DEFAULT 0
+        )
+    ''')
+    c.execute('INSERT OR IGNORE INTO incident_state (id, timer_started_at, incident_ready) VALUES (1, 0, 0)')
     conn.commit()
     conn.close()
 
@@ -50,32 +57,52 @@ def get_health():
     else:
         return 0.0, 0.0
 
+def get_incident_state():
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute('SELECT timer_started_at, incident_ready FROM incident_state WHERE id=1')
+    row = c.fetchone()
+    conn.close()
+    if row:
+        return float(row[0]), bool(row[1])
+    return 0.0, False
+
+def set_incident_state(timer_started_at=None, incident_ready=None):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    if timer_started_at is not None and incident_ready is not None:
+        c.execute('UPDATE incident_state SET timer_started_at=?, incident_ready=? WHERE id=1', (timer_started_at, int(incident_ready)))
+    elif timer_started_at is not None:
+        c.execute('UPDATE incident_state SET timer_started_at=? WHERE id=1', (timer_started_at,))
+    elif incident_ready is not None:
+        c.execute('UPDATE incident_state SET incident_ready=? WHERE id=1', (int(incident_ready),))
+    conn.commit()
+    conn.close()
+
+def reset_incident_state():
+    set_incident_state(timer_started_at=0, incident_ready=False)
+
+def check_all_servers_healthy():
+    for ip in COINFORGE_REQUIRED_IPS:
+        if not coin_forge_health.get(ip, {}).get("reachable", False):
+            return False
+    return True
+
+def maybe_update_incident_state():
+    timer_started_at, incident_ready = get_incident_state()
+    now = time.time()
+    if not incident_ready:
+        if check_all_servers_healthy():
+            if timer_started_at == 0:
+                set_incident_state(timer_started_at=now)
+            elif (now - timer_started_at) >= INCIDENT_TIMER_SECONDS:
+                set_incident_state(timer_started_at=0, incident_ready=True)
+        else:
+            if timer_started_at != 0:
+                set_incident_state(timer_started_at=0)
+
 # Initialize DB at startup
 init_db()
-
-
-def check_external_service_health(api_server_url, timeout=3):
-    """Ping the external API root and return (reachable, response_time_ms)."""
-    logger.info(f"Checking health of external API at {api_server_url} with timeout {timeout}s")
-    try:
-        start = time.perf_counter()
-        resp = requests.get(api_server_url, timeout=timeout)
-        elapsed_ms = (time.perf_counter() - start) * 1000
-        logger.info(f"Got response from {api_server_url} in {elapsed_ms:.2f} ms with status {resp.status_code}")
-        if 200 <= resp.status_code < 300:
-            return True, elapsed_ms
-        else:
-            logger.warning(f"Received unexpected status code {resp.status_code} from external API")
-            return False, elapsed_ms
-    except requests.exceptions.Timeout:
-        logger.error(f"Timeout when connecting to external API at {api_server_url}")
-        return False, 0.0
-    except requests.exceptions.ConnectionError as ce:
-        logger.error(f"Connection error when connecting to external API at {api_server_url}: {ce}")
-        return False, 0.0
-    except Exception as e:
-        logger.error(f"Unexpected error when checking external API health: {e}")
-        return False, 0.0
 
 # Mocking caldera and dcloud_session for standalone execution if actual modules are not present
 class MockCaldera:
@@ -149,55 +176,40 @@ DEFAULT_FALLBACK_DEVICES_TEMPLATE = {
     }
 }
 
-# --- Global device health state (in memory) ---
 coin_forge_health = {}
 for ip, data in DEFAULT_FALLBACK_DEVICES_TEMPLATE.items():
     coin_forge_health[ip] = data.copy()
     coin_forge_health[ip]["last_updated"] = time.time()
 
+import threading
 health_lock = threading.Lock()
-
-INCIDENT_TIMER_SECONDS = 300  # 5 minutes
-incident_lock = threading.Lock()
-incident_timer = None
-incident_ready = False  # Global flag for initiate_incident
-incident_per_server = {ip: False for ip in DEFAULT_FALLBACK_DEVICES_TEMPLATE}
-
-def reset_incident_status():
-    global incident_ready, incident_timer, incident_per_server
-    with incident_lock:
-        incident_ready = False
-        incident_per_server = {ip: False for ip in DEFAULT_FALLBACK_DEVICES_TEMPLATE}
-        if incident_timer is not None:
-            incident_timer.cancel()
-            incident_timer = None
-
-def check_all_servers_healthy():
-    with health_lock:
-        for ip in COINFORGE_REQUIRED_IPS:
-            device = coin_forge_health.get(ip, {})
-            if not device.get("reachable", False):
-                return False
-    return True
-
-def incident_timer_expired():
-    global incident_ready, incident_timer
-    with incident_lock:
-        incident_ready = True
-        incident_timer = None
-
-def maybe_start_incident_timer():
-    global incident_timer
-    with incident_lock:
-        if incident_timer is None and check_all_servers_healthy() and not incident_ready:
-            incident_timer = threading.Timer(INCIDENT_TIMER_SECONDS, incident_timer_expired)
-            incident_timer.start()
 
 # Flask app
 
-# Constants
 SESSION_XML_PATH = "/dcloud/session.xml"
 DEVICE_HEALTH_TIMEOUT_SECONDS = 900
+
+def check_external_service_health(api_server_url, timeout=3):
+    logger.info(f"Checking health of external API at {api_server_url} with timeout {timeout}s")
+    try:
+        start = time.perf_counter()
+        resp = requests.get(api_server_url, timeout=timeout)
+        elapsed_ms = (time.perf_counter() - start) * 1000
+        logger.info(f"Got response from {api_server_url} in {elapsed_ms:.2f} ms with status {resp.status_code}")
+        if 200 <= resp.status_code < 300:
+            return True, elapsed_ms
+        else:
+            logger.warning(f"Received unexpected status code {resp.status_code} from external API")
+            return False, elapsed_ms
+    except requests.exceptions.Timeout:
+        logger.error(f"Timeout when connecting to external API at {api_server_url}")
+        return False, 0.0
+    except requests.exceptions.ConnectionError as ce:
+        logger.error(f"Connection error when connecting to external API at {api_server_url}: {ce}")
+        return False, 0.0
+    except Exception as e:
+        logger.error(f"Unexpected error when checking external API health: {e}")
+        return False, 0.0
 
 def read_session_xml_as_json(xml_path):
     if not (os.path.isfile(xml_path)):
@@ -254,13 +266,11 @@ def health_check():
                 return jsonify({"error": "Payload missing 'ip' field."}), 400
 
             now = time.time()
-            # Get or initialize device state
             with health_lock:
                 device_state = coin_forge_health.get(device_ip, DEFAULT_FALLBACK_DEVICES_TEMPLATE.get(device_ip, {})).copy()
                 device_state.setdefault("consecutive_failures", 0)
                 device_state.setdefault("consecutive_successes", 0)
                 device_state.setdefault("state", "down")
-                # Update health data fields from incoming data
                 for key, value in data.items():
                     device_state[key] = value
 
@@ -268,21 +278,16 @@ def health_check():
                 device_state["consecutive_failures"] = 0
                 device_state["consecutive_successes"] += 1
 
-                # Debounce: Only mark up after threshold
                 if device_state["state"] != "up" and device_state["consecutive_successes"] >= DEBOUNCE_SUCCESS_THRESHOLD:
                     device_state["state"] = "up"
-                    # Optional: Reset counter on state change
                     device_state["consecutive_successes"] = 0
 
                 device_state["reachable"] = (device_state["state"] == "up")
                 coin_forge_health[device_ip] = device_state
 
-            logger.info(f"Updated debounced coin_forge_health for device IP {device_ip}.")
-            response_data = {"message": "Health-check received.", "device_ip": device_ip}
-            with incident_lock:
-                maybe_start_incident_timer()
-            with incident_lock:
-                response_data["initiate_incident"] = incident_ready
+            maybe_update_incident_state()
+            _, incident_ready = get_incident_state()
+            response_data = {"message": "Health-check received.", "device_ip": device_ip, "initiate_incident": incident_ready}
             return jsonify(response_data), 200
         except Exception as e:
             logger.error(f"Error in health_check POST endpoint: {e}")
@@ -299,16 +304,15 @@ def health_check():
                 if (current_time - last_updated) > DEVICE_HEALTH_TIMEOUT_SECONDS:
                     device_data["consecutive_failures"] += 1
                     device_data["consecutive_successes"] = 0
-                    # Debounce: Only mark down after threshold
                     if device_data["state"] != "down" and device_data["consecutive_failures"] >= DEBOUNCE_FAIL_THRESHOLD:
                         device_data["state"] = "down"
-                        # Optional: Reset counter on state change
                         device_data["consecutive_failures"] = 0
                     device_data["reachable"] = (device_data["state"] == "up")
-                # else: success handled in POST
                 coin_forge_health[ip] = device_data
 
-        # Check external API health
+        maybe_update_incident_state()
+        _, incident_ready = get_incident_state()
+
         api_server_url = os.getenv("API_SERVER_URL")
         if not api_server_url:
             logger.warning("API_SERVER_URL environment variable is not set.")
@@ -319,19 +323,17 @@ def health_check():
 
         response_data = {
             "external_svc_reachable": external_svc_reachable,
-            "external_svc_timeouts": 0,  # Optionally track real timeouts
+            "external_svc_timeouts": 0,
             "external_svc_response_time": external_svc_response_time,
         }
 
         with health_lock:
-            # Exclude debounce counters from output if you wish
             response_data.update({
                 ip: {k: v for k, v in data.items() if k not in ("consecutive_failures", "consecutive_successes", "state")}
                 for ip, data in coin_forge_health.items()
             })
-        with incident_lock:
-            response_data["initiate_incident"] = incident_ready
 
+        response_data["initiate_incident"] = incident_ready
         response_data.update({'controller_health': system_info.get_sys_info()})
 
         return jsonify(response_data), 200
@@ -395,7 +397,6 @@ def coins_endpoint():
             logger.error(f"An unexpected error occurred during POST request to API_SERVER_URL: {e}.")
             return jsonify({"error": f"Failed to process session: An unexpected error occurred with external service."}), 500
 
-        # Process actions in the response (only if the request to API_SERVER_URL was successful)
         if 'actions' in response.json() and isinstance(response.json()['actions'], list):
             try:
                 for action in response.json()['actions']:
@@ -450,21 +451,18 @@ def coins_endpoint():
         logger.error(f"Error during processing: {e}")
         return jsonify({"error": str(e)}), 500
 
-
 @app.route("/attack-initiated", methods=["POST"])
 def attack_initiated():
     try:
-        reset_incident_status()
-        logger.info("Attack initiated status reset.")
+        reset_incident_state()
+        logger.info("Attack initiated status reset (SQLite).")
         return jsonify({"message": "Incident initiation status reset."}), 200
     except Exception as e:
         logger.error(f"Error resetting incident status: {e}")
         return jsonify({"error": str(e)}), 500
 
-
 if __name__ == "__main__":
     from waitress import serve
-
     logger.info("Starting Flask app with Waitress...")
     if not os.path.exists(SESSION_XML_PATH):
         dcloud_session_mock.get_dcloud_session_xml()
