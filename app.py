@@ -109,9 +109,9 @@ logger = logging.getLogger()
 
 # --- Define default fallback devices template ---
 DEFAULT_FALLBACK_DEVICES_TEMPLATE = {
-    "198.18.135.155": {
+    "10.104.255.110": {
         "reachable": False,
-        "ip": "198.18.135.155",
+        "ip": "10.104.255.110",
         "hostname": "CoinForge-1",
         "cpu_utilization": "0.0",
         "memory_used_mb": "0",
