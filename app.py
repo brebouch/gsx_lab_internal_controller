@@ -14,7 +14,7 @@ import system_info
 app = Flask(__name__)
 CORS(app, origins=["http://198.18.5.179"])
 
-DEBOUNCE_FAIL_THRESHOLD = 1  # Number of missed checks before "down"
+DEBOUNCE_FAIL_THRESHOLD = 3  # Number of missed checks before "down"
 DEBOUNCE_SUCCESS_THRESHOLD = 1  # Number of successful checks before "up"
 
 COINFORGE_REQUIRED_IPS = {"10.104.255.110", "198.18.5.155", "10.1.100.20"}
