@@ -16,8 +16,10 @@ app = Flask(__name__)
 CORS(app, origins=["http://198.18.5.179"])
 
 
-DEBOUNCE_FAIL_THRESHOLD = 4  # Number of missed checks before "down"
+DEBOUNCE_FAIL_THRESHOLD = 1  # Number of missed checks before "down"
 DEBOUNCE_SUCCESS_THRESHOLD = 1  # Number of successful checks before "up"
+
+COINFORGE_REQUIRED_IPS = {"10.104.255.110", "198.18.5.155", "10.1.100.20"}
 
 # --- SQLite configuration for external health ---
 DB_PATH = "/tmp/health_status.db"
@@ -155,6 +157,42 @@ for ip, data in DEFAULT_FALLBACK_DEVICES_TEMPLATE.items():
 
 health_lock = threading.Lock()
 
+INCIDENT_TIMER_SECONDS = 300  # 5 minutes
+incident_lock = threading.Lock()
+incident_timer = None
+incident_ready = False  # Global flag for initiate_incident
+incident_per_server = {ip: False for ip in DEFAULT_FALLBACK_DEVICES_TEMPLATE}
+
+def reset_incident_status():
+    global incident_ready, incident_timer, incident_per_server
+    with incident_lock:
+        incident_ready = False
+        incident_per_server = {ip: False for ip in DEFAULT_FALLBACK_DEVICES_TEMPLATE}
+        if incident_timer is not None:
+            incident_timer.cancel()
+            incident_timer = None
+
+def check_all_servers_healthy():
+    with health_lock:
+        for ip in COINFORGE_REQUIRED_IPS:
+            device = coin_forge_health.get(ip, {})
+            if not device.get("reachable", False):
+                return False
+    return True
+
+def incident_timer_expired():
+    global incident_ready, incident_timer
+    with incident_lock:
+        incident_ready = True
+        incident_timer = None
+
+def maybe_start_incident_timer():
+    global incident_timer
+    with incident_lock:
+        if incident_timer is None and check_all_servers_healthy() and not incident_ready:
+            incident_timer = threading.Timer(INCIDENT_TIMER_SECONDS, incident_timer_expired)
+            incident_timer.start()
+
 # Flask app
 
 # Constants
@@ -240,7 +278,12 @@ def health_check():
                 coin_forge_health[device_ip] = device_state
 
             logger.info(f"Updated debounced coin_forge_health for device IP {device_ip}.")
-            return jsonify({"message": "Health-check received.", "device_ip": device_ip}), 200
+            response_data = {"message": "Health-check received.", "device_ip": device_ip}
+            with incident_lock:
+                maybe_start_incident_timer()
+            with incident_lock:
+                response_data["initiate_incident"] = incident_ready
+            return jsonify(response_data), 200
         except Exception as e:
             logger.error(f"Error in health_check POST endpoint: {e}")
             return jsonify({"error": str(e)}), 500
@@ -286,6 +329,8 @@ def health_check():
                 ip: {k: v for k, v in data.items() if k not in ("consecutive_failures", "consecutive_successes", "state")}
                 for ip, data in coin_forge_health.items()
             })
+        with incident_lock:
+            response_data["initiate_incident"] = incident_ready
 
         response_data.update({'controller_health': system_info.get_sys_info()})
 
@@ -404,6 +449,18 @@ def coins_endpoint():
     except Exception as e:
         logger.error(f"Error during processing: {e}")
         return jsonify({"error": str(e)}), 500
+
+
+@app.route("/attack-initiated", methods=["POST"])
+def attack_initiated():
+    try:
+        reset_incident_status()
+        logger.info("Attack initiated status reset.")
+        return jsonify({"message": "Incident initiation status reset."}), 200
+    except Exception as e:
+        logger.error(f"Error resetting incident status: {e}")
+        return jsonify({"error": str(e)}), 500
+
 
 if __name__ == "__main__":
     from waitress import serve
