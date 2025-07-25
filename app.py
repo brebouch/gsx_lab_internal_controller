@@ -3,14 +3,18 @@ import os
 import time
 import xml.etree.ElementTree as ET
 import sqlite3
-import json # Added for storing dict as JSON in DB
-
+import json
 import requests
+import socket
+import ipaddress
+
 from dotenv import load_dotenv
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 
 import system_info # Assuming this module exists and works as expected
+from blocked_domain_check import is_umbrella_blocked
+from sa_tunnel_check import is_secure_access_tunnel_up
 
 app = Flask(__name__)
 CORS(app, origins=["http://198.18.5.179"])
@@ -73,6 +77,12 @@ DEFAULT_FALLBACK_DEVICES_TEMPLATE = {
     }
 }
 
+# Load environment variables for vManage credentials
+load_dotenv()
+VMANAGE_HOST = os.getenv("VMANAGE_HOST")
+VMANAGE_USERNAME = os.getenv("VMANAGE_USERNAME")
+VMANAGE_PASSWORD = os.getenv("VMANAGE_PASSWORD")
+
 def _get_db_connection():
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row # This allows accessing columns by name
@@ -106,17 +116,27 @@ def init_db():
     conn.commit()
     conn.close()
 
-def init_tunnel_state_db():
+def init_destination_state_db(): # Renamed function
     conn = _get_db_connection()
     c = conn.cursor()
-    c.execute('''CREATE TABLE IF NOT EXISTS tunnel_state (
+    # Drop table to clear on reload as requested
+    c.execute('DROP TABLE IF EXISTS destination_state')
+    c.execute('''CREATE TABLE IF NOT EXISTS destination_state (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
-        destination_domain TEXT NOT NULL,
-        tunnel_ip TEXT NOT NULL,
+        destination_type TEXT NOT NULL,
+        destination TEXT NOT NULL,
         flag_name TEXT NOT NULL,
         reachable INTEGER DEFAULT 0,
-        UNIQUE(destination_domain, tunnel_ip)
+        UNIQUE(destination_type, destination)
     )''')
+    # Insert default values
+    default_destinations = [
+        {"flag_name": "tunnel_up", "reachable": False, "destination_type": "tunnel", "destination": "BRANCH-SITE-105-C8Kv"},
+        {"flag_name": "domain_blocked", "reachable": False, "destination_type": "domain", "destination": "gambling.com"}
+    ]
+    for item in default_destinations:
+        c.execute('INSERT OR IGNORE INTO destination_state (destination_type, destination, flag_name, reachable) VALUES (?, ?, ?, ?)',
+                  (item["destination_type"], item["destination"], item["flag_name"], int(item["reachable"])))
     conn.commit()
     conn.close()
 
@@ -149,31 +169,32 @@ def get_all_device_health_from_db():
         all_devices[row['ip']] = json.loads(row['data'])
     return all_devices
 
-# --- Existing DB Operations (modified to use _get_db_connection) ---
-def get_unreachable_tunnels():
+# --- Destination State DB Operations (formerly tunnel_state) ---
+def get_unreachable_destinations(): # Renamed function
     conn = _get_db_connection()
     c = conn.cursor()
-    c.execute('SELECT destination_domain, tunnel_ip, flag_name FROM tunnel_state WHERE reachable=0')
+    c.execute('SELECT destination_type, destination, flag_name FROM destination_state WHERE reachable=0')
     rows = c.fetchall()
     conn.close()
     return rows
 
-def mark_tunnel_reachable(destination_domain, tunnel_ip):
+def mark_destination_reachable(destination_type, destination): # Renamed function and args
     conn = _get_db_connection()
     c = conn.cursor()
-    c.execute('UPDATE tunnel_state SET reachable=1 WHERE destination_domain=? AND tunnel_ip=?',
-              (destination_domain, tunnel_ip))
+    c.execute('UPDATE destination_state SET reachable=1 WHERE destination_type=? AND destination=?',
+              (destination_type, destination))
     conn.commit()
     conn.close()
 
-def insert_tunnel_state(destination_domain, tunnel_ip, flag_name):
+def insert_destination_state(destination_type, destination, flag_name): # Renamed function and args
     conn = _get_db_connection()
     c = conn.cursor()
-    c.execute('INSERT OR IGNORE INTO tunnel_state (destination_domain, tunnel_ip, flag_name) VALUES (?, ?, ?)',
-              (destination_domain, tunnel_ip, flag_name))
+    c.execute('INSERT OR IGNORE INTO destination_state (destination_type, destination, flag_name) VALUES (?, ?, ?)',
+              (destination_type, destination, flag_name))
     conn.commit()
     conn.close()
 
+# --- Existing DB Operations (modified to use _get_db_connection) ---
 def set_health(last_success, response_time):
     conn = _get_db_connection()
     c = conn.cursor()
@@ -240,7 +261,7 @@ def maybe_update_incident_state():
 
 # Initialize DBs at startup
 init_db()
-init_tunnel_state_db()
+init_destination_state_db() # Call the renamed function
 
 # Mocking caldera and dcloud_session for standalone execution if actual modules are not present
 class MockCaldera:
@@ -259,7 +280,7 @@ class MockDcloudSession:
         logging.info("Mock dCloud: Getting session XML.")
         # Ensure the directory exists
         os.makedirs(os.path.dirname(SESSION_XML_PATH), exist_ok=True)
-        with open(SESSION_XML_PATH, "w") as f: # Use SESSION_XML_PATH directly
+        with open(SESSION_XML_PATH, "w") as f:
             f.write("<session><id>mock_session_123</id></session>")
 
 caldera_mock = MockCaldera()
@@ -269,7 +290,6 @@ run_operation = caldera_mock.run_operation
 check_operation_run = caldera_mock.check_operation_run
 get_dcloud_session_xml = dcloud_session_mock.get_dcloud_session_xml
 
-load_dotenv()
 
 SESSION_XML_PATH = "/dcloud/session.xml"
 DEVICE_HEALTH_TIMEOUT_SECONDS = 900
@@ -338,33 +358,17 @@ def post_caldera_status(api_server_url, api_token, session_id, operation_name, o
     except Exception as e:
         logger.error(f"Error posting operation status for '{operation_name}': {e}")
 
-def domain_not_blocked(domain):
-    try:
-        resp = requests.get(f"http://{domain}", timeout=5)
-        if "block" in resp.text.lower():
-            return False
-        return True
-    except Exception as e:
-        logger.warning(f"Failed to reach {domain}: {e}")
-        return False
-
-def ping_ip(ip):
-    import platform
-    import subprocess
-    param = "-n" if platform.system().lower() == "windows" else "-c"
-    command = ["ping", param, "1", ip]
-    return subprocess.call(command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL) == 0
 
 @app.route("/add-tunnel", methods=["POST"])
 def add_tunnel():
     data = request.get_json()
-    destination_domain = data.get("destination_domain")
-    tunnel_ip = data.get("tunnel_ip")
+    destination_type = data.get("destination_type")
+    destination = data.get("destination")
     flag_name = data.get("flag_name")
-    if not all([destination_domain, tunnel_ip, flag_name]):
+    if not all([destination_type, destination, flag_name]):
         return jsonify({"error": "Missing required fields"}), 400
-    insert_tunnel_state(destination_domain, tunnel_ip, flag_name)
-    return jsonify({"message": "Tunnel added"}), 200
+    insert_destination_state(destination_type, destination, flag_name)
+    return jsonify({"message": "Destination added"}), 200
 
 @app.route("/health-check", methods=["POST", "GET"])
 def health_check():
@@ -387,7 +391,6 @@ def health_check():
                 device_state = DEFAULT_FALLBACK_DEVICES_TEMPLATE.get(device_ip, {}).copy()
                 if not device_state: # If IP not even in default template
                     logger.warning(f"Health check received for unknown device IP: {device_ip}")
-                    # Optionally, you could return an error or add it with minimal info
                     return jsonify({"error": f"Unknown device IP: {device_ip}"}), 400
                 # Ensure all necessary keys are present for a new device
                 device_state.setdefault("consecutive_failures", 0)
@@ -429,7 +432,6 @@ def health_check():
     elif request.method == "GET":
         current_time = time.time()
         all_devices = get_all_device_health_from_db()
-        updated_devices = {}
 
         for ip, device_data in all_devices.items():
             last_updated = device_data.get("last_updated", 0)
@@ -437,6 +439,7 @@ def health_check():
             device_data.setdefault("consecutive_successes", 0)
             device_data.setdefault("state", "up") # Default to up if not set
 
+            # Check for timeout and apply debouncing logic
             if (current_time - last_updated) > DEVICE_HEALTH_TIMEOUT_SECONDS:
                 device_data["consecutive_failures"] += 1
                 device_data["consecutive_successes"] = 0 # Reset successes on timeout/failure
@@ -444,15 +447,14 @@ def health_check():
                     device_data["state"] = "down"
                     device_data["consecutive_failures"] = 0 # Reset failures after state change
                 device_data["reachable"] = (device_data["state"] == "up")
-                updated_devices[ip] = device_data # Mark for update
+                update_device_health_in_db(ip, device_data) # Update immediately if state changed
 
-            # Always ensure reachable status is consistent with state
+            # Always ensure reachable status is consistent with state for the response
             device_data["reachable"] = (device_data["state"] == "up")
-            updated_devices[ip] = device_data # Ensure all devices are included for final response
 
-        # Batch update devices that changed due to timeout or for consistency
-        for ip, data in updated_devices.items():
-            update_device_health_in_db(ip, data)
+        # Re-fetch all devices to ensure the response reflects any updates made above
+        all_devices = get_all_device_health_from_db()
+
 
         maybe_update_incident_state()
         _, incident_ready = get_incident_state()
@@ -467,12 +469,12 @@ def health_check():
 
         response_data = {
             "external_svc_reachable": external_svc_reachable,
-            "external_svc_timeouts": 0, # This field is always 0, might need to be dynamic
+            "external_svc_timeouts": 0,
             "external_svc_response_time": external_svc_response_time,
         }
 
         # Prepare device data for response, excluding internal debouncing fields
-        for ip, data in all_devices.items(): # Use `all_devices` which now contains the latest state from DB
+        for ip, data in all_devices.items():
             response_data[ip] = {k: v for k, v in data.items() if k not in ("consecutive_failures", "consecutive_successes", "state")}
 
         response_data["initiate_incident"] = incident_ready
@@ -588,22 +590,38 @@ def coins_endpoint():
             except Exception as e:
                 logger.error(f"Error running action: {e}")
 
-        # --- Tunnel & flag check logic starts here ---
+        # --- Destination & flag check logic starts here ---
         try:
-            unreachable_tunnels = get_unreachable_tunnels()
-            for dest_domain, tunnel_ip, flag_name in unreachable_tunnels:
-                if domain_not_blocked(dest_domain) or ping_ip(tunnel_ip):
+            unreachable_destinations = get_unreachable_destinations()
+            for dest_type, dest_value, flag_name in unreachable_destinations:
+                condition_met = False
+                if dest_type == "tunnel":
+                    # VMANAGE_HOST, VMANAGE_USERNAME, VMANAGE_PASSWORD are pulled from environment variables
+                    if not all([VMANAGE_HOST, VMANAGE_USERNAME, VMANAGE_PASSWORD]):
+                        logger.error("VMANAGE_HOST, VMANAGE_USERNAME, VMANAGE_PASSWORD environment variables must be set for tunnel checks.")
+                        continue
+                    condition_met = is_secure_access_tunnel_up(VMANAGE_HOST, VMANAGE_USERNAME, VMANAGE_PASSWORD, dest_value)
+                    logger.info(f"Tunnel check for {dest_value}: {'UP' if condition_met else 'DOWN'}")
+                elif dest_type == "domain":
+                    # is_umbrella_blocked is used directly
+                    condition_met = not is_umbrella_blocked(dest_value) # True if NOT blocked
+                    logger.info(f"Domain check for {dest_value}: {'NOT BLOCKED' if condition_met else 'BLOCKED'}")
+                else:
+                    logger.warning(f"Unknown destination type: {dest_type}")
+                    continue
+
+                if condition_met:
                     capture_flag_url = api_server_url.rstrip("/") + "/capture-flag"
                     post_payload = {"session_id": session_id, "flag_name": flag_name}
                     headers = {"Authorization": f'Bearer {api_token}'}
                     try:
                         r = requests.post(capture_flag_url, json=post_payload, headers=headers, timeout=5)
-                        logger.info(f"/capture-flag POSTed for {dest_domain}/{tunnel_ip}: {r.status_code}")
+                        logger.info(f"/capture-flag POSTed for {dest_type}/{dest_value}: {r.status_code}")
                     except Exception as e:
                         logger.error(f"Error posting to /capture-flag: {e}")
-                    mark_tunnel_reachable(dest_domain, tunnel_ip)
+                    mark_destination_reachable(dest_type, dest_value)
         except Exception as e:
-            logger.error(f"Tunnel state check failed: {e}")
+            logger.error(f"Destination state check failed: {e}")
 
         return jsonify({"message": "Session processed successfully."}), 200
 
