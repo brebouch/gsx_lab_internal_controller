@@ -542,6 +542,7 @@ def coins_endpoint():
             return jsonify({"error": f"Failed to process session: An unexpected error occurred with external service."}), 500
 
         # Action handler (unchanged)
+        '''
         if 'actions' in response.json() and isinstance(response.json()['actions'], list):
             try:
                 for action in response.json()['actions']:
@@ -589,6 +590,7 @@ def coins_endpoint():
                             logger.error(f"Error checking operation '{operation_id}': {e}")
             except Exception as e:
                 logger.error(f"Error running action: {e}")
+        '''
 
         # --- Destination & flag check logic starts here ---
         try:
