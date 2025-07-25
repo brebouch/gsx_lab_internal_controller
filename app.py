@@ -606,8 +606,8 @@ def coins_endpoint():
                     logger.info(f"Tunnel check for {dest_value}: {'UP' if condition_met else 'DOWN'}")
                 elif dest_type == "domain":
                     # is_umbrella_blocked is used directly
-                    condition_met = not is_umbrella_blocked(dest_value) # True if NOT blocked
-                    logger.info(f"Domain check for {dest_value}: {'NOT BLOCKED' if condition_met else 'BLOCKED'}")
+                    condition_met = is_umbrella_blocked(dest_value) # True if NOT blocked
+                    logger.info(f"Domain check for {dest_value}: {'BLOCKED' if condition_met else 'NOT BLOCKED'}")
                 else:
                     logger.warning(f"Unknown destination type: {dest_type}")
                     continue
