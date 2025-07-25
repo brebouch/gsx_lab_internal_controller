@@ -3,31 +3,86 @@ import os
 import time
 import xml.etree.ElementTree as ET
 import sqlite3
+import json # Added for storing dict as JSON in DB
 
 import requests
 from dotenv import load_dotenv
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 
-import system_info
+import system_info # Assuming this module exists and works as expected
 
 app = Flask(__name__)
 CORS(app, origins=["http://198.18.5.179"])
 
-DEBOUNCE_FAIL_THRESHOLD = 3  # Number of missed checks before "down"
-DEBOUNCE_SUCCESS_THRESHOLD = 1  # Number of successful checks before "up"
-
+DEBOUNCE_FAIL_THRESHOLD = 3
+DEBOUNCE_SUCCESS_THRESHOLD = 1
 COINFORGE_REQUIRED_IPS = {"198.18.5.155"}
 
 DB_PATH = "/tmp/health_status.db"
 INCIDENT_TIMER_SECONDS = 300  # 5 minutes
 
-def init_db():
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger()
+
+DEFAULT_FALLBACK_DEVICES_TEMPLATE = {
+    "10.104.255.110": {
+        "reachable": False,
+        "ip": "10.104.255.110",
+        "hostname": "CoinForge-1",
+        "cpu_utilization": "0.0",
+        "memory_used_mb": "0",
+        "memory_total_mb": "0",
+        "network_bytes_in": "0",
+        "network_bytes_out": "0",
+        "remote_connection": False,
+        "last_updated": 0.0,
+        "consecutive_failures": 0,
+        "consecutive_successes": 0,
+        "state": "down"
+    },
+    "198.18.5.155": {
+        "reachable": False,
+        "ip": "198.18.5.155",
+        "hostname": "CoinForge-2",
+        "cpu_utilization": "0.0",
+        "memory_used_mb": "0",
+        "memory_total_mb": "0",
+        "network_bytes_in": "0",
+        "network_bytes_out": "0",
+        "remote_connection": False,
+        "last_updated": 0.0,
+        "consecutive_failures": 0,
+        "consecutive_successes": 0,
+        "state": "down"
+    },
+    "10.1.100.20": {
+        "reachable": False,
+        "ip": "10.1.100.20",
+        "hostname": "CoinForge-3",
+        "cpu_utilization": "0.0",
+        "memory_used_mb": "0",
+        "memory_total_mb": "0",
+        "network_bytes_in": "0",
+        "network_bytes_out": "0",
+        "remote_connection": False,
+        "last_updated": 0.0,
+        "consecutive_failures": 0,
+        "consecutive_successes": 0,
+        "state": "down"
+    }
+}
+
+def _get_db_connection():
     conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row # This allows accessing columns by name
+    return conn
+
+def init_db():
+    conn = _get_db_connection()
     c = conn.cursor()
     c.execute("CREATE TABLE IF NOT EXISTS health (id INTEGER PRIMARY KEY, last_success REAL, response_time REAL)")
     c.execute("INSERT OR IGNORE INTO health (id, last_success, response_time) VALUES (1, 0, 0)")
-    # Incident logic state: one-row table
     c.execute('''
         CREATE TABLE IF NOT EXISTS incident_state (
             id INTEGER PRIMARY KEY CHECK (id = 1),
@@ -36,18 +91,98 @@ def init_db():
         )
     ''')
     c.execute('INSERT OR IGNORE INTO incident_state (id, timer_started_at, incident_ready) VALUES (1, 0, 0)')
+
+    # New table for device health
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS device_health (
+            ip TEXT PRIMARY KEY,
+            data TEXT NOT NULL
+        )
+    ''')
+    # Populate with default devices if not already present
+    for ip, data in DEFAULT_FALLBACK_DEVICES_TEMPLATE.items():
+        c.execute('INSERT OR IGNORE INTO device_health (ip, data) VALUES (?, ?)',
+                  (ip, json.dumps(data)))
+    conn.commit()
+    conn.close()
+
+def init_tunnel_state_db():
+    conn = _get_db_connection()
+    c = conn.cursor()
+    c.execute('''CREATE TABLE IF NOT EXISTS tunnel_state (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        destination_domain TEXT NOT NULL,
+        tunnel_ip TEXT NOT NULL,
+        flag_name TEXT NOT NULL,
+        reachable INTEGER DEFAULT 0,
+        UNIQUE(destination_domain, tunnel_ip)
+    )''')
+    conn.commit()
+    conn.close()
+
+# --- Device Health DB Operations ---
+def get_device_health_from_db(device_ip):
+    conn = _get_db_connection()
+    c = conn.cursor()
+    c.execute('SELECT data FROM device_health WHERE ip = ?', (device_ip,))
+    row = c.fetchone()
+    conn.close()
+    if row:
+        return json.loads(row['data'])
+    return None
+
+def update_device_health_in_db(device_ip, device_data):
+    conn = _get_db_connection()
+    c = conn.cursor()
+    c.execute('UPDATE device_health SET data = ? WHERE ip = ?', (json.dumps(device_data), device_ip))
+    conn.commit()
+    conn.close()
+
+def get_all_device_health_from_db():
+    conn = _get_db_connection()
+    c = conn.cursor()
+    c.execute('SELECT ip, data FROM device_health')
+    rows = c.fetchall()
+    conn.close()
+    all_devices = {}
+    for row in rows:
+        all_devices[row['ip']] = json.loads(row['data'])
+    return all_devices
+
+# --- Existing DB Operations (modified to use _get_db_connection) ---
+def get_unreachable_tunnels():
+    conn = _get_db_connection()
+    c = conn.cursor()
+    c.execute('SELECT destination_domain, tunnel_ip, flag_name FROM tunnel_state WHERE reachable=0')
+    rows = c.fetchall()
+    conn.close()
+    return rows
+
+def mark_tunnel_reachable(destination_domain, tunnel_ip):
+    conn = _get_db_connection()
+    c = conn.cursor()
+    c.execute('UPDATE tunnel_state SET reachable=1 WHERE destination_domain=? AND tunnel_ip=?',
+              (destination_domain, tunnel_ip))
+    conn.commit()
+    conn.close()
+
+def insert_tunnel_state(destination_domain, tunnel_ip, flag_name):
+    conn = _get_db_connection()
+    c = conn.cursor()
+    c.execute('INSERT OR IGNORE INTO tunnel_state (destination_domain, tunnel_ip, flag_name) VALUES (?, ?, ?)',
+              (destination_domain, tunnel_ip, flag_name))
     conn.commit()
     conn.close()
 
 def set_health(last_success, response_time):
-    conn = sqlite3.connect(DB_PATH)
+    conn = _get_db_connection()
     c = conn.cursor()
     c.execute("UPDATE health SET last_success=?, response_time=? WHERE id=1", (last_success, response_time))
     conn.commit()
     conn.close()
 
 def get_health():
-    conn = sqlite3.connect(DB_PATH)
+    conn = _get_db_connection()
     c = conn.cursor()
     c.execute("SELECT last_success, response_time FROM health WHERE id=1")
     row = c.fetchone()
@@ -58,7 +193,7 @@ def get_health():
         return 0.0, 0.0
 
 def get_incident_state():
-    conn = sqlite3.connect(DB_PATH)
+    conn = _get_db_connection()
     c = conn.cursor()
     c.execute('SELECT timer_started_at, incident_ready FROM incident_state WHERE id=1')
     row = c.fetchone()
@@ -68,7 +203,7 @@ def get_incident_state():
     return 0.0, False
 
 def set_incident_state(timer_started_at=None, incident_ready=None):
-    conn = sqlite3.connect(DB_PATH)
+    conn = _get_db_connection()
     c = conn.cursor()
     if timer_started_at is not None and incident_ready is not None:
         c.execute('UPDATE incident_state SET timer_started_at=?, incident_ready=? WHERE id=1', (timer_started_at, int(incident_ready)))
@@ -83,8 +218,10 @@ def reset_incident_state():
     set_incident_state(timer_started_at=0, incident_ready=False)
 
 def check_all_servers_healthy():
+    all_devices = get_all_device_health_from_db()
     for ip in COINFORGE_REQUIRED_IPS:
-        if not coin_forge_health.get(ip, {}).get("reachable", False):
+        # Check if the device exists in our health tracking and is reachable
+        if ip not in all_devices or not all_devices[ip].get("reachable", False):
             return False
     return True
 
@@ -101,8 +238,9 @@ def maybe_update_incident_state():
             if timer_started_at != 0:
                 set_incident_state(timer_started_at=0)
 
-# Initialize DB at startup
+# Initialize DBs at startup
 init_db()
+init_tunnel_state_db()
 
 # Mocking caldera and dcloud_session for standalone execution if actual modules are not present
 class MockCaldera:
@@ -119,7 +257,9 @@ class MockCaldera:
 class MockDcloudSession:
     def get_dcloud_session_xml(self):
         logging.info("Mock dCloud: Getting session XML.")
-        with open("session.xml", "w") as f:
+        # Ensure the directory exists
+        os.makedirs(os.path.dirname(SESSION_XML_PATH), exist_ok=True)
+        with open(SESSION_XML_PATH, "w") as f: # Use SESSION_XML_PATH directly
             f.write("<session><id>mock_session_123</id></session>")
 
 caldera_mock = MockCaldera()
@@ -129,62 +269,7 @@ run_operation = caldera_mock.run_operation
 check_operation_run = caldera_mock.check_operation_run
 get_dcloud_session_xml = dcloud_session_mock.get_dcloud_session_xml
 
-# Load environment variables
 load_dotenv()
-
-# Logging
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
-logger = logging.getLogger()
-
-# --- Define default fallback devices template ---
-DEFAULT_FALLBACK_DEVICES_TEMPLATE = {
-    "10.104.255.110": {
-        "reachable": False,
-        "ip": "10.104.255.110",
-        "hostname": "CoinForge-1",
-        "cpu_utilization": "0.0",
-        "memory_used_mb": "0",
-        "memory_total_mb": "0",
-        "network_bytes_in": "0",
-        "network_bytes_out": "0",
-        "remote_connection": False,
-        "last_updated": 0.0
-    },
-    "198.18.5.155": {
-        "reachable": False,
-        "ip": "198.18.5.155",
-        "hostname": "CoinForge-2",
-        "cpu_utilization": "0.0",
-        "memory_used_mb": "0",
-        "memory_total_mb": "0",
-        "network_bytes_in": "0",
-        "network_bytes_out": "0",
-        "remote_connection": False,
-        "last_updated": 0.0
-    },
-    "10.1.100.20": {
-        "reachable": False,
-        "ip": "10.1.100.20",
-        "hostname": "CoinForge-3",
-        "cpu_utilization": "0.0",
-        "memory_used_mb": "0",
-        "memory_total_mb": "0",
-        "network_bytes_in": "0",
-        "network_bytes_out": "0",
-        "remote_connection": False,
-        "last_updated": 0.0
-    }
-}
-
-coin_forge_health = {}
-for ip, data in DEFAULT_FALLBACK_DEVICES_TEMPLATE.items():
-    coin_forge_health[ip] = data.copy()
-    coin_forge_health[ip]["last_updated"] = time.time()
-
-import threading
-health_lock = threading.Lock()
-
-# Flask app
 
 SESSION_XML_PATH = "/dcloud/session.xml"
 DEVICE_HEALTH_TIMEOUT_SECONDS = 900
@@ -253,6 +338,34 @@ def post_caldera_status(api_server_url, api_token, session_id, operation_name, o
     except Exception as e:
         logger.error(f"Error posting operation status for '{operation_name}': {e}")
 
+def domain_not_blocked(domain):
+    try:
+        resp = requests.get(f"http://{domain}", timeout=5)
+        if "block" in resp.text.lower():
+            return False
+        return True
+    except Exception as e:
+        logger.warning(f"Failed to reach {domain}: {e}")
+        return False
+
+def ping_ip(ip):
+    import platform
+    import subprocess
+    param = "-n" if platform.system().lower() == "windows" else "-c"
+    command = ["ping", param, "1", ip]
+    return subprocess.call(command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL) == 0
+
+@app.route("/add-tunnel", methods=["POST"])
+def add_tunnel():
+    data = request.get_json()
+    destination_domain = data.get("destination_domain")
+    tunnel_ip = data.get("tunnel_ip")
+    flag_name = data.get("flag_name")
+    if not all([destination_domain, tunnel_ip, flag_name]):
+        return jsonify({"error": "Missing required fields"}), 400
+    insert_tunnel_state(destination_domain, tunnel_ip, flag_name)
+    return jsonify({"message": "Tunnel added"}), 200
+
 @app.route("/health-check", methods=["POST", "GET"])
 def health_check():
     if request.method == "POST":
@@ -266,24 +379,44 @@ def health_check():
                 return jsonify({"error": "Payload missing 'ip' field."}), 400
 
             now = time.time()
-            with health_lock:
-                device_state = coin_forge_health.get(device_ip, DEFAULT_FALLBACK_DEVICES_TEMPLATE.get(device_ip, {})).copy()
+
+            # Get current device state from DB
+            device_state = get_device_health_from_db(device_ip)
+            if device_state is None:
+                # If device not in DB, use default template and insert
+                device_state = DEFAULT_FALLBACK_DEVICES_TEMPLATE.get(device_ip, {}).copy()
+                if not device_state: # If IP not even in default template
+                    logger.warning(f"Health check received for unknown device IP: {device_ip}")
+                    # Optionally, you could return an error or add it with minimal info
+                    return jsonify({"error": f"Unknown device IP: {device_ip}"}), 400
+                # Ensure all necessary keys are present for a new device
                 device_state.setdefault("consecutive_failures", 0)
                 device_state.setdefault("consecutive_successes", 0)
                 device_state.setdefault("state", "down")
-                for key, value in data.items():
-                    device_state[key] = value
-
                 device_state["last_updated"] = now
-                device_state["consecutive_failures"] = 0
-                device_state["consecutive_successes"] += 1
+                # Initial insert
+                update_device_health_in_db(device_ip, device_state)
+                # Re-fetch to ensure consistency if multiple processes try to insert
+                device_state = get_device_health_from_db(device_ip)
 
-                if device_state["state"] != "up" and device_state["consecutive_successes"] >= DEBOUNCE_SUCCESS_THRESHOLD:
-                    device_state["state"] = "up"
-                    device_state["consecutive_successes"] = 0
 
-                device_state["reachable"] = (device_state["state"] == "up")
-                coin_forge_health[device_ip] = device_state
+            # Update device state with received data
+            for key, value in data.items():
+                device_state[key] = value
+
+            device_state["last_updated"] = now
+            device_state["consecutive_failures"] = 0 # Reset failures on success
+            device_state["consecutive_successes"] += 1
+
+            # Apply debouncing for success
+            if device_state["state"] != "up" and device_state["consecutive_successes"] >= DEBOUNCE_SUCCESS_THRESHOLD:
+                device_state["state"] = "up"
+                device_state["consecutive_successes"] = 0 # Reset successes after state change
+
+            device_state["reachable"] = (device_state["state"] == "up")
+
+            # Save updated device state back to DB
+            update_device_health_in_db(device_ip, device_state)
 
             maybe_update_incident_state()
             _, incident_ready = get_incident_state()
@@ -295,20 +428,31 @@ def health_check():
 
     elif request.method == "GET":
         current_time = time.time()
-        with health_lock:
-            for ip, device_data in coin_forge_health.items():
-                last_updated = device_data.get("last_updated", 0)
-                device_data.setdefault("consecutive_failures", 0)
-                device_data.setdefault("consecutive_successes", 0)
-                device_data.setdefault("state", "up")
-                if (current_time - last_updated) > DEVICE_HEALTH_TIMEOUT_SECONDS:
-                    device_data["consecutive_failures"] += 1
-                    device_data["consecutive_successes"] = 0
-                    if device_data["state"] != "down" and device_data["consecutive_failures"] >= DEBOUNCE_FAIL_THRESHOLD:
-                        device_data["state"] = "down"
-                        device_data["consecutive_failures"] = 0
-                    device_data["reachable"] = (device_data["state"] == "up")
-                coin_forge_health[ip] = device_data
+        all_devices = get_all_device_health_from_db()
+        updated_devices = {}
+
+        for ip, device_data in all_devices.items():
+            last_updated = device_data.get("last_updated", 0)
+            device_data.setdefault("consecutive_failures", 0)
+            device_data.setdefault("consecutive_successes", 0)
+            device_data.setdefault("state", "up") # Default to up if not set
+
+            if (current_time - last_updated) > DEVICE_HEALTH_TIMEOUT_SECONDS:
+                device_data["consecutive_failures"] += 1
+                device_data["consecutive_successes"] = 0 # Reset successes on timeout/failure
+                if device_data["state"] != "down" and device_data["consecutive_failures"] >= DEBOUNCE_FAIL_THRESHOLD:
+                    device_data["state"] = "down"
+                    device_data["consecutive_failures"] = 0 # Reset failures after state change
+                device_data["reachable"] = (device_data["state"] == "up")
+                updated_devices[ip] = device_data # Mark for update
+
+            # Always ensure reachable status is consistent with state
+            device_data["reachable"] = (device_data["state"] == "up")
+            updated_devices[ip] = device_data # Ensure all devices are included for final response
+
+        # Batch update devices that changed due to timeout or for consistency
+        for ip, data in updated_devices.items():
+            update_device_health_in_db(ip, data)
 
         maybe_update_incident_state()
         _, incident_ready = get_incident_state()
@@ -323,15 +467,13 @@ def health_check():
 
         response_data = {
             "external_svc_reachable": external_svc_reachable,
-            "external_svc_timeouts": 0,
+            "external_svc_timeouts": 0, # This field is always 0, might need to be dynamic
             "external_svc_response_time": external_svc_response_time,
         }
 
-        with health_lock:
-            response_data.update({
-                ip: {k: v for k, v in data.items() if k not in ("consecutive_failures", "consecutive_successes", "state")}
-                for ip, data in coin_forge_health.items()
-            })
+        # Prepare device data for response, excluding internal debouncing fields
+        for ip, data in all_devices.items(): # Use `all_devices` which now contains the latest state from DB
+            response_data[ip] = {k: v for k, v in data.items() if k not in ("consecutive_failures", "consecutive_successes", "state")}
 
         response_data["initiate_incident"] = incident_ready
         response_data.update({'controller_health': system_info.get_sys_info()})
@@ -397,6 +539,7 @@ def coins_endpoint():
             logger.error(f"An unexpected error occurred during POST request to API_SERVER_URL: {e}.")
             return jsonify({"error": f"Failed to process session: An unexpected error occurred with external service."}), 500
 
+        # Action handler (unchanged)
         if 'actions' in response.json() and isinstance(response.json()['actions'], list):
             try:
                 for action in response.json()['actions']:
@@ -444,6 +587,23 @@ def coins_endpoint():
                             logger.error(f"Error checking operation '{operation_id}': {e}")
             except Exception as e:
                 logger.error(f"Error running action: {e}")
+
+        # --- Tunnel & flag check logic starts here ---
+        try:
+            unreachable_tunnels = get_unreachable_tunnels()
+            for dest_domain, tunnel_ip, flag_name in unreachable_tunnels:
+                if domain_not_blocked(dest_domain) or ping_ip(tunnel_ip):
+                    capture_flag_url = api_server_url.rstrip("/") + "/capture-flag"
+                    post_payload = {"session_id": session_id, "flag_name": flag_name}
+                    headers = {"Authorization": f'Bearer {api_token}'}
+                    try:
+                        r = requests.post(capture_flag_url, json=post_payload, headers=headers, timeout=5)
+                        logger.info(f"/capture-flag POSTed for {dest_domain}/{tunnel_ip}: {r.status_code}")
+                    except Exception as e:
+                        logger.error(f"Error posting to /capture-flag: {e}")
+                    mark_tunnel_reachable(dest_domain, tunnel_ip)
+        except Exception as e:
+            logger.error(f"Tunnel state check failed: {e}")
 
         return jsonify({"message": "Session processed successfully."}), 200
 
