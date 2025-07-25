@@ -619,9 +619,10 @@ def coins_endpoint():
                     try:
                         r = requests.post(capture_flag_url, json=post_payload, headers=headers, timeout=5)
                         logger.info(f"/capture-flag POSTed for {dest_type}/{dest_value}: {r.status_code}")
+                        if r.status_code == 200:
+                            mark_destination_reachable(dest_type, dest_value)
                     except Exception as e:
                         logger.error(f"Error posting to /capture-flag: {e}")
-                    mark_destination_reachable(dest_type, dest_value)
         except Exception as e:
             logger.error(f"Destination state check failed: {e}")
 
