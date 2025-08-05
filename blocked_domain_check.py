@@ -1,48 +1,22 @@
-import socket
-import ipaddress
-
-# Cisco Umbrella block page IP addresses (A and AAAA)
-BLOCK_IPS = {
-    "146.112.61.104",
-    "146.112.61.105",
-    "146.112.61.106",
-    "146.112.61.107",
-    "146.112.61.108",
-    "146.112.61.110",
-    "::ffff:146.112.61.104",
-    "::ffff:146.112.61.105",
-    "::ffff:146.112.61.106",
-    "::ffff:146.112.61.107",
-    "::ffff:146.112.61.108",
-    "::ffff:146.112.61.110"
-}
+import requests
 
 def is_umbrella_blocked(domain):
     """
-    Resolves a domain and returns True if the response matches a Cisco Umbrella block page,
-    otherwise returns False.
+    Makes an HTTPS request to the domain and returns True if the response HTML
+    matches a Cisco Umbrella block page, otherwise returns False.
     """
     try:
-        infos = socket.getaddrinfo(domain, None)
-        for info in infos:
-            family, _, _, _, sockaddr = info
-            if family == socket.AF_INET:
-                ip = sockaddr[0]
-            elif family == socket.AF_INET6:
-                ip = ipaddress.ip_address(sockaddr[0]).compressed
-            else:
-                continue
-            try:
-                ip_obj = ipaddress.ip_address(ip)
-                if isinstance(ip_obj, ipaddress.IPv6Address) and ip_obj.ipv4_mapped:
-                    ip = f"::ffff:{ip_obj.ipv4_mapped}"
-            except Exception:
-                pass
-            if ip in BLOCK_IPS:
-                return True
-        return False
-    except Exception:
-        # If resolution fails, consider it not blocked by Umbrella
+        url = f"https://{domain}"
+        response = requests.get(url, timeout=5, verify=True)
+        html = response.text
+
+        # Check for both block indicators in the HTML
+        if "<title>Site Blocked</title>" in html and "This site is blocked." in html:
+            return True
+        else:
+            return False
+    except requests.RequestException:
+        # If the request fails (timeout, connection error, etc.), consider it not blocked
         return False
 
 # Example usage
