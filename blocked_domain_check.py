@@ -21,6 +21,6 @@ def is_umbrella_blocked(domain):
 
 # Example usage
 if __name__ == "__main__":
-    domain = "internetbadguys.com"
+    domain = "gambling.com"
     result = is_umbrella_blocked(domain)
     print(f"Domain {domain} is blocked by Umbrella: {result}")
