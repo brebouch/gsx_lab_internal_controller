@@ -425,6 +425,7 @@ def health_check():
             _, incident_ready = get_incident_state()
             response_data = {"message": "Health-check received.", "device_ip": device_ip}
             if device_ip != '10.1.100.20':
+                logger.info(f"Sending the following trigger incident bool for  {device_ip}: {incident_ready}")
                 response_data.update({"initiate_incident": incident_ready})
             return jsonify(response_data), 200
         except Exception as e:
