@@ -5,8 +5,6 @@ import xml.etree.ElementTree as ET
 import sqlite3
 import json
 import requests
-import socket
-import ipaddress
 
 from dotenv import load_dotenv
 from flask import Flask, request, jsonify
@@ -22,6 +20,7 @@ CORS(app, origins=["http://198.18.5.179"])
 DEBOUNCE_FAIL_THRESHOLD = 3
 DEBOUNCE_SUCCESS_THRESHOLD = 1
 COINFORGE_REQUIRED_IPS = {"10.104.255.110", "198.18.5.155"}
+LAB_STARTED = False
 
 DB_PATH = "/tmp/health_status.db"
 INCIDENT_TIMER_SECONDS = 300  # 5 minutes
@@ -82,6 +81,7 @@ load_dotenv()
 VMANAGE_HOST = os.getenv("VMANAGE_HOST")
 VMANAGE_USERNAME = os.getenv("VMANAGE_USERNAME")
 VMANAGE_PASSWORD = os.getenv("VMANAGE_PASSWORD")
+
 
 def _get_db_connection():
     conn = sqlite3.connect(DB_PATH)
@@ -478,8 +478,8 @@ def health_check():
         # Prepare device data for response, excluding internal debouncing fields
         for ip, data in all_devices.items():
             response_data[ip] = {k: v for k, v in data.items() if k not in ("consecutive_failures", "consecutive_successes", "state")}
-
-        response_data["initiate_incident"] = incident_ready
+        if LAB_STARTED:
+            response_data["initiate_incident"] = incident_ready
         response_data.update({'controller_health': system_info.get_sys_info()})
 
         return jsonify(response_data), 200
@@ -520,6 +520,9 @@ def coins_endpoint():
                 now = time.time()
                 set_health(now, response_time_ms)
                 logger.info(f"/coins: Success! Setting last_success = {now}, response_time = {response_time_ms}")
+                global LAB_STARTED
+                if not LAB_STARTED:
+                    LAB_STARTED = True
             else:
                 logger.error(
                     f"POST request to API_SERVER_URL failed with status code {response.status_code}: {response.text}.")
