@@ -21,7 +21,7 @@ CORS(app, origins=["http://198.18.5.179"])
 
 DEBOUNCE_FAIL_THRESHOLD = 3
 DEBOUNCE_SUCCESS_THRESHOLD = 1
-COINFORGE_REQUIRED_IPS = {"10.104.255.110", "198.18.5.155", "10.1.100.20"}
+COINFORGE_REQUIRED_IPS = {"10.104.255.110", "198.18.5.155"}
 
 DB_PATH = "/tmp/health_status.db"
 INCIDENT_TIMER_SECONDS = 300  # 5 minutes
@@ -508,43 +508,6 @@ def coins_endpoint():
 
         logger.info(f"Processing session: {session_id}. Making outgoing call to {api_server_url}/coin")
 
-        # --- Destination & flag check logic starts here ---
-        try:
-            unreachable_destinations = get_unreachable_destinations()
-            for dest_type, dest_value, flag_name in unreachable_destinations:
-                condition_met = False
-                if dest_type == "tunnel":
-                    # VMANAGE_HOST, VMANAGE_USERNAME, VMANAGE_PASSWORD are pulled from environment variables
-                    if not all([VMANAGE_HOST, VMANAGE_USERNAME, VMANAGE_PASSWORD]):
-                        logger.error(
-                            "VMANAGE_HOST, VMANAGE_USERNAME, VMANAGE_PASSWORD environment variables must be set for tunnel checks.")
-                        continue
-                    condition_met = is_secure_access_tunnel_up(VMANAGE_HOST, VMANAGE_USERNAME, VMANAGE_PASSWORD,
-                                                               dest_value)
-                    logger.info(f"Tunnel check for {dest_value}: {'UP' if condition_met else 'DOWN'}")
-                elif dest_type == "domain":
-                    # is_umbrella_blocked is used directly
-                    condition_met = is_umbrella_blocked(dest_value)  # True if NOT blocked
-                    logger.info(f"Domain check for {dest_value}: {'BLOCKED' if condition_met else 'NOT BLOCKED'}")
-                else:
-                    logger.warning(f"Unknown destination type: {dest_type}")
-                    continue
-                '''
-                if condition_met:
-                    capture_flag_url = api_server_url.rstrip("/") + "/capture-flag"
-                    post_payload = {"session_id": session_id, "flag_name": flag_name}
-                    headers = {"Authorization": f'Bearer {api_token}'}
-                    try:
-                        r = requests.post(capture_flag_url, json=post_payload, headers=headers, timeout=5)
-                        logger.info(f"/capture-flag POSTed for {dest_type}/{dest_value}: {r.status_code}")
-                        if r.status_code == 200:
-                            mark_destination_reachable(dest_type, dest_value)
-                    except Exception as e:
-                        logger.error(f"Error posting to /capture-flag: {e}")
-                '''
-        except Exception as e:
-            logger.error(f"Destination state check failed: {e}")
-
         start_time = time.perf_counter()
         try:
             response = requests.post(f"{api_server_url}/coin", json=payload, headers=headers, timeout=10)
@@ -629,7 +592,39 @@ def coins_endpoint():
                 logger.error(f"Error running action: {e}")
         '''
 
+        # --- Destination & flag check logic starts here ---
+        try:
+            unreachable_destinations = get_unreachable_destinations()
+            for dest_type, dest_value, flag_name in unreachable_destinations:
+                condition_met = False
+                if dest_type == "tunnel":
+                    # VMANAGE_HOST, VMANAGE_USERNAME, VMANAGE_PASSWORD are pulled from environment variables
+                    if not all([VMANAGE_HOST, VMANAGE_USERNAME, VMANAGE_PASSWORD]):
+                        logger.error("VMANAGE_HOST, VMANAGE_USERNAME, VMANAGE_PASSWORD environment variables must be set for tunnel checks.")
+                        continue
+                    condition_met = is_secure_access_tunnel_up(VMANAGE_HOST, VMANAGE_USERNAME, VMANAGE_PASSWORD, dest_value)
+                    logger.info(f"Tunnel check for {dest_value}: {'UP' if condition_met else 'DOWN'}")
+                elif dest_type == "domain":
+                    # is_umbrella_blocked is used directly
+                    condition_met = is_umbrella_blocked(dest_value) # True if NOT blocked
+                    logger.info(f"Domain check for {dest_value}: {'BLOCKED' if condition_met else 'NOT BLOCKED'}")
+                else:
+                    logger.warning(f"Unknown destination type: {dest_type}")
+                    continue
 
+                if condition_met:
+                    capture_flag_url = api_server_url.rstrip("/") + "/capture-flag"
+                    post_payload = {"session_id": session_id, "flag_name": flag_name}
+                    headers = {"Authorization": f'Bearer {api_token}'}
+                    try:
+                        r = requests.post(capture_flag_url, json=post_payload, headers=headers, timeout=5)
+                        logger.info(f"/capture-flag POSTed for {dest_type}/{dest_value}: {r.status_code}")
+                        if r.status_code == 200:
+                            mark_destination_reachable(dest_type, dest_value)
+                    except Exception as e:
+                        logger.error(f"Error posting to /capture-flag: {e}")
+        except Exception as e:
+            logger.error(f"Destination state check failed: {e}")
 
         return jsonify({"message": "Session processed successfully."}), 200
 
