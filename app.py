@@ -379,6 +379,8 @@ def health_check():
                 return jsonify({"error": "Invalid JSON payload."}), 400
 
             device_ip = data.get("ip")
+            if device_ip.startswith("10."):
+                print(f'Device IP: {device_ip}')
             if not device_ip:
                 return jsonify({"error": "Payload missing 'ip' field."}), 400
 
@@ -425,7 +427,6 @@ def health_check():
             _, incident_ready = get_incident_state()
             response_data = {"message": "Health-check received.", "device_ip": device_ip}
             if device_ip != '10.1.100.20':
-                logger.info(f"Sending the following trigger incident bool for  {device_ip}: {incident_ready}")
                 response_data.update({"initiate_incident": incident_ready})
             return jsonify(response_data), 200
         except Exception as e:
@@ -647,6 +648,14 @@ def attack_initiated():
     except Exception as e:
         logger.error(f"Error resetting incident status: {e}")
         return jsonify({"error": str(e)}), 500
+
+
+@app.route("/", methods=["GET", "POST"])
+def catch_all():
+    print('CATCH ALL HIT')
+    data = request.get_json()
+    print(data)
+    print(request.headers)
 
 if __name__ == "__main__":
     from waitress import serve
